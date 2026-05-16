@@ -1,0 +1,301 @@
+From: TurboQuant CANN Port
+Date: Sat May 16 2026
+Subject: [PATCH] ggml-cann: add TQ3_4S/TQ3_1S quantized matmul support
+
+Add TQ3 weight dequant → FP16 matmul path for the CANN backend.
+
+The CANN backend's ggml_cann_mul_mat previously only supported
+F32/F16/BF16/Q4_0/Q8_0. This adds TQ3_4S (type 46) and TQ3_1S (type 44).
+
+Strategy: CPU-dequant TQ3 blocks to FP32 → ACL cast to FP16 on device →
+existing FP16 matmul. This is a correct but slow path; future work should
+replace CPU dequant with an Ascend C kernel.
+
+---
+ ggml/src/ggml-cann/aclnn_ops.cpp       |  52 ++++++
+ ggml/src/ggml-cann/CMakeLists.txt       |   1 +
+ ggml/src/ggml-cann/tq3_cann.h          |  38 +++++
+ ggml/src/ggml-cann/tq3_cann.cpp        | 210 ++++++++++++++++++++++++
+ 4 files changed, 301 insertions(+)
+
+diff --git a/ggml/src/ggml-cann/aclnn_ops.cpp b/ggml/src/ggml-cann/aclnn_ops.cpp
+index xxxxx..yyyyy 100644
+--- a/ggml/src/ggml-cann/aclnn_ops.cpp
++++ b/ggml/src/ggml-cann/aclnn_ops.cpp
+@@ -28,6 +28,8 @@
+ #include <aclnnop/aclnn_batch_matmul.h>
+ #include <aclnnop/aclnn_cast.h>
+ 
++#include "tq3_cann.h"
++
+ #define MATRIX_GEMM_SPLIT_NUM 8
+ #define MATRIX_ROW_PADDING 512
+ 
+@@ -2203,10 +2205,58 @@ static void ggml_cann_mul_mat_quant(ggml_backend_cann_context & ctx, ggml_tenso
+ void ggml_cann_mul_mat(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
+     const enum ggml_type type = dst->src[0]->type;
+     switch (type) {
++        case GGML_TYPE_TQ3_4S:
++        case GGML_TYPE_TQ3_1S:
++            ggml_cann_mul_mat_tq3(ctx, dst);
++            break;
+         case GGML_TYPE_F32:
+         case GGML_TYPE_F16:
+...
+diff --git a/ggml/src/ggml-cann/CMakeLists.txt b/ggml/src/ggml-cann/CMakeLists.txt
+index xxxxx..yyyyy 100644
+--- a/ggml/src/ggml-cann/CMakeLists.txt
++++ b/ggml/src/ggml-cann/CMakeLists.txt
+@@ -5,6 +5,7 @@
+ set(ggml_cann_sources
+     acl_tensor.cpp
+     aclnn_ops.cpp
++    tq3_cann.cpp
+     ggml-cann.cpp
+ )
+ 
+diff --git a/ggml/src/ggml-cann/tq3_cann.h b/ggml/src/ggml-cann/tq3_cann.h
+new file mode 100644
+index 0000000..eeeeeee
+--- /dev/null
++++ b/ggml/src/ggml-cann/tq3_cann.h
+@@ -0,0 +1,38 @@
++#pragma once
++//
++// TQ3 (TurboQuant 3-bit) dequant + matmul for ggml-cann backend.
++//
++// TQ3_4S (type 46): 4 × E3M5 per-8 scales + 12 B packed 3-bit indices = 16 B / 32 elem
++// TQ3_1S (type 44): 2 × FP16 half-block scales + 12 B packed 3-bit indices = 16 B / 32 elem
++//
++#include "ggml-cann/common.h"
++
++void ggml_cann_mul_mat_tq3(ggml_backend_cann_context & ctx, ggml_tensor * dst);
++
+diff --git a/ggml/src/ggml-cann/tq3_cann.cpp b/ggml/src/ggml-cann/tq3_cann.cpp
+new file mode 100644
+index 0000000..eeeeeee
+--- /dev/null
++++ b/ggml/src/ggml-cann/tq3_cann.cpp
+@@ -0,0 +1,210 @@
+// ─── TQ3 dequant → FP16 matmul for ggml-cann backend ──────────────────
+#include "tq3_cann.h"
+#include "aclnn_ops.h"
+#include "common.h"
+#include "ggml-impl.h"
+
+#include <aclnnop/aclnn_cast.h>
+#include <cmath>
+#include <cstring>
+
+// ─── helpers ─────────────────────────────────────────────────────────
+static float golden_sign(int i) {
+    return ((((unsigned)i * 0x9E3779B9u) >> 31) & 1) ? -1.0f : 1.0f;
+}
+
+static const float centroids[8] = {
+    -2.1519f, -1.3439f, -0.7560f, -0.2451f,
+     0.2451f,  0.7560f,  1.3439f,  2.1519f
+};
+
+static float e3m5_decode(uint8_t v) {
+    int e = (v >> 5) & 7, m = v & 0x1F;
+    return ldexpf(1.0f + m / 32.0f, e - 9);
+}
+
+static void unpack_3bit(const uint8_t qs[12], uint8_t idx[32]) {
+    for (int i = 0; i < 32; i++) {
+        int bp = (i * 3) / 8, bo = (i * 3) % 8;
+        uint32_t w = qs[bp] | ((uint32_t)(bp + 1 < 12 ? qs[bp+1] : 0) << 8);
+        idx[i] = (w >> bo) & 7;
+    }
+}
+
+static void wht_32(float v[32]) {
+    for (int step = 1; step < 32; step <<= 1)
+        for (int i = 0; i < 32; i++)
+            if (int j = i ^ step; j > i) {
+                float a = v[i], b = v[j];
+                v[i] = a + b; v[j] = a - b;
+            }
+}
+
+// ─── dequant TQ3_4S block → 32 FP32 ──────────────────────────────────
+static void dequant_tq3_4s_block(const uint8_t blk[16], float * out) {
+    float sc[4];
+    for (int g = 0; g < 4; g++) sc[g] = e3m5_decode(blk[g]);
+
+    uint8_t idx[32];
+    unpack_3bit(blk + 4, idx);
+
+    float buf[32];
+    for (int i = 0; i < 32; i++) buf[i] = centroids[idx[i]] * sc[i / 8];
+
+    wht_32(buf);
+
+    const float rcp = 0.1767766952966369f; // 1/sqrt(32)
+    for (int i = 0; i < 32; i++) out[i] = buf[i] * golden_sign(i) * rcp;
+}
+
+// ─── dequant TQ3_1S block → 32 FP32 ──────────────────────────────────
+static void dequant_tq3_1s_block(const uint8_t blk[16], float * out) {
+    // d0, d1: FP16 half-block scales
+    uint16_t d0_raw, d1_raw;
+    memcpy(&d0_raw, blk, 2);
+    memcpy(&d1_raw, blk + 2, 2);
+
+    auto fp16_to_f32 = [](uint16_t h) -> float {
+        // manual FP16→FP32 (no _cvtsh_ss on ARM)
+        uint32_t s = (h >> 15) & 1;
+        uint32_t e = (h >> 10) & 0x1F;
+        uint32_t m = h & 0x3FF;
+        if (e == 0) {
+            // subnormal
+            int shift = 9;
+            while (!(m & 0x400)) { m <<= 1; shift++; }
+            m &= 0x3FF;
+            e = 1 - shift + 15;
+        }
+        uint32_t f32 = (s << 31) | ((e + 112) << 23) | (m << 13);
+        float result;
+        memcpy(&result, &f32, 4);
+        return result;
+    };
+
+    float s0 = fp16_to_f32(d0_raw);
+    float s1 = fp16_to_f32(d1_raw);
+
+    uint8_t idx[32];
+    unpack_3bit(blk + 4, idx);
+
+    float buf[32];
+    for (int i = 0; i < 32; i++) {
+        float sc = (i < 16) ? s0 : s1;
+        buf[i] = centroids[idx[i]] * sc;
+    }
+
+    wht_32(buf);
+
+    const float rcp = 0.1767766952966369f;
+    for (int i = 0; i < 32; i++) out[i] = buf[i] * golden_sign(i) * rcp;
+}
+
+// ─── full tensor dequant dispatch ────────────────────────────────────
+static void dequant_tq3_tensor(const ggml_tensor * src, float * dst) {
+    auto * data = (const uint8_t *)src->data;
+    int64_t rows = src->ne[1], cols = src->ne[0];
+    int64_t nb = cols / 32;
+
+    if (src->type == GGML_TYPE_TQ3_4S) {
+        for (int64_t r = 0; r < rows; r++)
+            for (int64_t b = 0; b < nb; b++)
+                dequant_tq3_4s_block(data + (r * nb + b) * 16,
+                                     dst + r * cols + b * 32);
+    } else {
+        for (int64_t r = 0; r < rows; r++)
+            for (int64_t b = 0; b < nb; b++)
+                dequant_tq3_1s_block(data + (r * nb + b) * 16,
+                                     dst + r * cols + b * 32);
+    }
+}
+
+// ─── public: ggml_cann_mul_mat_tq3 ──────────────────────────────────
+void ggml_cann_mul_mat_tq3(ggml_backend_cann_context & ctx, ggml_tensor * dst) {
+    ggml_tensor * src0 = dst->src[0];   // weights (TQ3_4S or TQ3_1S)
+    ggml_tensor * src1 = dst->src[1];   // activations (FP16/FP32)
+
+    int64_t K = src0->ne[0];   // inner dim
+    int64_t M = src0->ne[1];   // weight rows = output dim
+    int64_t N = src1->ne[1];   // tokens
+
+    // validate
+    GGML_ASSERT(src0->type == GGML_TYPE_TQ3_4S || src0->type == GGML_TYPE_TQ3_1S);
+    GGML_ASSERT(K == src1->ne[0]);  // dimensions match
+
+    int64_t num_weights = M * K;
+
+    // 1. CPU dequant → FP32
+    size_t f32_sz = num_weights * sizeof(float);
+    ggml_cann_pool_alloc f32_buf(ctx.pool());
+    auto * f32_w = (float *)f32_buf.alloc(f32_sz);
+    dequant_tq3_tensor(src0, f32_w);
+
+    // 2. upload to device + cast to FP16
+    size_t f16_sz = num_weights * sizeof(uint16_t);
+    ggml_cann_pool_alloc f16_buf(ctx.pool());
+    auto * f16_w = (uint16_t *)f16_buf.alloc(f16_sz);
+
+    {
+        int64_t ne_w[]  = { K, M };
+        size_t  nb_f32[] = { sizeof(float), K * sizeof(float) };
+        size_t  nb_f16[] = { sizeof(uint16_t), K * sizeof(uint16_t) };
+
+        acl_tensor_ptr acl_f32_t = ggml_cann_create_tensor(
+            f32_w, ACL_FLOAT, sizeof(float), ne_w, nb_f32, 2);
+        acl_tensor_ptr acl_f16_t = ggml_cann_create_tensor(
+            f16_w, ACL_FLOAT16, sizeof(uint16_t), ne_w, nb_f16, 2);
+        GGML_CANN_CALL_ACLNN_OP(ctx, Cast, acl_f32_t.get(), acl_f16_t.get());
+    }
+
+    // 3. handle input (cast to FP16 if needed)
+    bool input_is_f16 = (src1->type == GGML_TYPE_F16);
+    ggml_cann_pool_alloc in_buf(ctx.pool());
+    void * in_dev = src1->data;
+
+    if (!input_is_f16) {
+        size_t in_sz = ggml_nelements(src1) * sizeof(uint16_t);
+        in_dev = in_buf.alloc(in_sz);
+
+        int64_t ne_in[]  = { K, N };
+        size_t  nb_in[]  = { ggml_type_size(src1->type), K * ggml_type_size(src1->type) };
+        size_t  nb_in16[] = { sizeof(uint16_t), K * sizeof(uint16_t) };
+
+        acl_tensor_ptr acl_in_src = ggml_cann_create_tensor(
+            src1->data, ggml_cann_type_mapping(src1->type),
+            ggml_type_size(src1->type), ne_in, nb_in, 2);
+        acl_tensor_ptr acl_in_dst = ggml_cann_create_tensor(
+            in_dev, ACL_FLOAT16, sizeof(uint16_t), ne_in, nb_in16, 2);
+        GGML_CANN_CALL_ACLNN_OP(ctx, Cast, acl_in_src.get(), acl_in_dst.get());
+    }
+
+    // 4. FP16 matmul: output[M×N] = weights[M×K] × activation[K×N]
+    size_t out_sz = M * N * sizeof(uint16_t);
+    ggml_cann_pool_alloc out_buf(ctx.pool());
+    auto * out_dev = (uint16_t *)out_buf.alloc(out_sz);
+
+    {
+        int64_t ne_w_t[]  = { K, M };
+        size_t  nb_w_t[]  = { sizeof(uint16_t), K * sizeof(uint16_t) };
+
+        int64_t ne_a[]    = { K, N };
+        size_t  nb_a[]    = { sizeof(uint16_t), K * sizeof(uint16_t) };
+
+        int64_t ne_o[]    = { M, N };
+        size_t  nb_o[]    = { sizeof(uint16_t), M * sizeof(uint16_t) };
+
+        acl_tensor_ptr acl_w = ggml_cann_create_tensor(
+            f16_w, ACL_FLOAT16, sizeof(uint16_t), ne_w_t, nb_w_t, 2);
+        acl_tensor_ptr acl_a = ggml_cann_create_tensor(
+            in_dev, ACL_FLOAT16, sizeof(uint16_t), ne_a, nb_a, 2);
+        acl_tensor_ptr acl_o = ggml_cann_create_tensor(
+            out_dev, ACL_FLOAT16, sizeof(uint16_t), ne_o, nb_o, 2);
+
+        GGML_CANN_CALL_ACLNN_OP(ctx, BatchMatMul, acl_w.get(), acl_a.get(), acl_o.get());
+    }
+
+    // 5. cast output to dst type if needed
+    if (dst->type != GGML_TYPE_F16) {
+        int64_t ne_o[]   = { M, N };
+        size_t  nb_o16[] = { sizeof(uint16_t), M * sizeof(uint16_t) };
+        size_t  nb_od[]  = { ggml_type_size(dst->type), M * ggml_type_size(dst->type) };
+
+        acl_tensor_ptr acl_o16 = ggml_cann_create_tensor(
+            out_dev, ACL_FLOAT16, sizeof(uint16_t), ne_o, nb_o16, 2);
+        acl_tensor_ptr acl_od  = ggml_cann_create_tensor(
+            dst->data, ggml_cann_type_mapping(dst->type),
+            ggml_type_size(dst->type), ne_o, nb_od, 2);
+        GGML_CANN_CALL_ACLNN_OP(ctx, Cast, acl_o16.get(), acl_od.get());
+    } else {
+        // copy device buffer to dst
+        ACL_CHECK(aclrtMemcpy(dst->data, out_sz, out_dev, out_sz, ACL_MEMCPY_DEVICE_TO_DEVICE));
+    }
+}

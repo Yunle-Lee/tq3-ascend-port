@@ -1,0 +1,23 @@
+[
+    {
+        "op": "Tq3Dequant",
+        "input_desc": [
+            {
+                "name": "x",
+                "param_type": "required",
+                "dtype": "uint8",
+                "format": ["ND"],
+                "shape": ["-1"]
+            }
+        ],
+        "output_desc": [
+            {
+                "name": "y",
+                "param_type": "required",
+                "dtype": "float16",
+                "format": ["ND"],
+                "shape": ["-1"]
+            }
+        ]
+    }
+]
