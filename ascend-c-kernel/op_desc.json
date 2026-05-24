@@ -1,13 +1,21 @@
 [
     {
         "op": "Tq3Dequant",
+        "attr": [
+            {
+                "name": "quant_type",
+                "param_type": "required",
+                "type": "int",
+                "default_value": 0
+            }
+        ],
         "input_desc": [
             {
                 "name": "x",
                 "param_type": "required",
                 "dtype": "uint8",
                 "format": ["ND"],
-                "shape": ["-1"]
+                "shape": ["-1", "-1"]
             }
         ],
         "output_desc": [
@@ -16,7 +24,7 @@
                 "param_type": "required",
                 "dtype": "float16",
                 "format": ["ND"],
-                "shape": ["-1"]
+                "shape": ["-1", "-1"]
             }
         ]
     }

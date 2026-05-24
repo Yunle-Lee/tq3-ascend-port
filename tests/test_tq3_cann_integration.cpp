@@ -9,6 +9,7 @@
 //   g++ -std=c++17 -O2 -I /mnt/workspace/llama.cpp-tq3/ggml/include \
 //       -I /mnt/workspace/llama.cpp-tq3/ggml/src \
 //       -I /mnt/workspace/llama.cpp-tq3/ggml/src/ggml-cann \
+//       -I ../ggml-cann-integration \
 //       -I /home/developer/Ascend/cann-8.5.0/include \
 //       -I /home/developer/Ascend/cann-8.5.0/include/aclnn \
 //       -I /home/developer/Ascend/cann-8.5.0/acllib/include \
@@ -38,43 +39,10 @@ struct block_tq3_4s {
 };
 static_assert(sizeof(block_tq3_4s) == 16, "block_tq3_4s must be 16 bytes");
 
-// ─── helpers (duplicated from tq3_cann.cpp to avoid linker dependency) ────
-static float golden_sign(int i) {
-    return ((((unsigned)i * 0x9E3779B9u) >> 31) & 1) ? -1.0f : 1.0f;
-}
-static const float centroids[8] = {
-    -2.1519f, -1.3439f, -0.7560f, -0.2451f,
-     0.2451f,  0.7560f,  1.3439f,  2.1519f
-};
-static float e3m5_decode(uint8_t v) {
-    int e = (v >> 5) & 7, m = v & 0x1F;
-    return ldexpf(1.0f + m / 32.0f, e - 9);
-}
-static void unpack_3bit(const uint8_t qs[12], uint8_t idx[32]) {
-    for (int i = 0; i < 32; i++) {
-        int bp = (i * 3) / 8, bo = (i * 3) % 8;
-        uint32_t w = qs[bp] | ((uint32_t)(bp + 1 < 12 ? qs[bp+1] : 0) << 8);
-        idx[i] = (w >> bo) & 7;
-    }
-}
-static void wht_32(float v[32]) {
-    for (int step = 1; step < 32; step <<= 1)
-        for (int i = 0; i < 32; i++)
-            if (int j = i ^ step; j > i) {
-                float a = v[i], b = v[j];
-                v[i] = a + b; v[j] = a - b;
-            }
-}
+// ─── helpers from tq3_cann_kernels.h ────────────────────────────────
+#include "tq3_cann_kernels.h"
 static void dequant_one_block(const uint8_t blk[16], float * out) {
-    float sc[4];
-    for (int g = 0; g < 4; g++) sc[g] = e3m5_decode(blk[g]);
-    uint8_t idx[32];
-    unpack_3bit(blk + 4, idx);
-    float buf[32];
-    for (int i = 0; i < 32; i++) buf[i] = centroids[idx[i]] * sc[i / 8];
-    wht_32(buf);
-    const float rcp = 0.1767766952966369f;
-    for (int i = 0; i < 32; i++) out[i] = buf[i] * golden_sign(i) * rcp;
+    tq3_4s_dequant_block(blk, out);
 }
 
 // ─── manually quantize float data to TQ3_4S ────────────────────────────

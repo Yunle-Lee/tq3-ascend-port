@@ -27,7 +27,6 @@ g++ -std=c++17 -O2 \
     -I "$DIR/ggml-cann-integration" \
     -o /tmp/test_tq3_dequant \
     "$DIR/tests/test_tq3_dequant.cpp" \
-    "$DIR/ggml-cann-integration/tq3_cann.cpp" \
     -lm
 /tmp/test_tq3_dequant
 echo ""

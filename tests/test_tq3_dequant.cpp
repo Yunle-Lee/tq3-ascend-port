@@ -1,5 +1,5 @@
 // Test TQ3_4S dequant against the reference from the CUDA backend
-// Compile: g++ -std=c++17 -O2 -I . -I ../llama.cpp-tq3/ggml/include -o test_tq3_dequant test_tq3_dequant.cpp tq3_cann_kernels.cpp -lm
+// Compile: g++ -std=c++17 -O2 -I ../ggml-cann-integration -o test_tq3_dequant test_tq3_dequant.cpp -lm
 
 #include "tq3_cann_kernels.h"
 #include <cstdio>

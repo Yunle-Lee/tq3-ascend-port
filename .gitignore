@@ -1,0 +1,29 @@
+# Build artifacts
+build/
+cmake-build-*/
+*.o
+*.so
+*.a
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test binaries
+tests/test_tq3_dequant
+tests/test_tq3_cann_integration
+
+# CANN artifacts
+*.om
+*.json~
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
