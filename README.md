@@ -605,3 +605,7 @@ extern "C" __global__ __aicore__ void tq3_dequant(GM_ADDR workspace, GM_ADDR til
 本项目是对 llama.cpp-tq3 中 TQ3 内核的移植改编。llama.cpp 遵循 MIT 许可。移植代码继承原项目许可。
 
 This project is a port/adaptation of TQ3 kernels from llama.cpp-tq3, which builds on [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT License). The port code follows the same license.
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=Yunle-Lee/tq3-ascend-port&type=date&legend=top-left)](https://www.star-history.com/#Yunle-Lee/tq3-ascend-port&type=date&legend=top-left)
